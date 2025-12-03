@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg[binary]
+passlib[bcrypt]
+bcrypt==4.3.0
+python-multipart
+python-jose[cryptography]
+alembic
+bs4
+httpx
+redis
+qrcode[pil]
