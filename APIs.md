@@ -155,89 +155,6 @@ Creates a new shortened URL for the authenticated user, with optional custom ali
 }
 ```
 
-**Code**
-
-```py
-#LongToShort
-@router.post("/shorten/",status_code = status.HTTP_201_CREATED)
-async def shorten_link(user: user_dependency, db: db_dependency, link: LinkRequest, redis: Redis = Depends(get_redis)):
-    link_model = await create_link_for_user(db, user, link)
-
-    data = link_to_dict(link_model)
-
-    # Invalidate user's list
-    redis.delete(links_user(link_model.user_id))
-    # Populate single-link cache
-    redis.set(link_key(link_model.short_code if link_model.short_code else link_model.alias 
-                             ), json.dumps(data), ex=CACHE_TTL_SECONDS) #  
-
-    return data
-
-async def create_link_for_user(db: Session, user, link: LinkRequest) -> database_models.Links:
-    user_id = user.get('id')
-    if not user_id:
-        raise HTTPException(401, detail='Authentication Failed.')
-
-    timestamp = datetime.now(timezone.utc)
-    
-    #check for existing link with same URL
-    link_check = db.query(database_models.Links).filter(
-        (database_models.Links.original_url == str(link.original_url)),
-        (database_models.Links.user_id == user_id)).first()
-    if link_check:
-        raise HTTPException(409,detail="You already have a link for this URL.")
-
-    if link.alias: #custom alias provided
-        
-        link_check = db.query(database_models.Links).filter(
-                (database_models.Links.short_code == link.alias)|
-                (database_models.Links.alias == link.alias)).first()
-        if link_check:
-            if str(link.original_url) != link_check.original_url:
-                raise HTTPException(409,detail="A different Link already uses this alias.")
-            if link_check.user_id == user_id:
-                raise HTTPException(409,detail="You have already created this link.")
-            #same link already exists for different user, just link it to this user
-            add_link_to_user(user_id, link_check.id, link.title if link.title else link_check.title, db)
-            return link_check
-        
-        title = await fetch_title(str(link.original_url))
-        link_model = database_models.Links(
-        original_url = str(link.original_url), user_id = user_id, 
-        title = title, short_code = None, alias = link.alias,
-        created_at=timestamp, short_url = API_URL + link.alias)
-    
-    else: #no custom alias
-        #check for existing link with same URL
-        link_check = db.query(database_models.Links).filter(
-            database_models.Links.original_url == str(link.original_url)).first()
-        if link_check:
-            #same link already exists for different user, just link it to this user
-            add_link_to_user(user_id, link_check.id, link.title if link.title else link_check.title, db)
-            return link_check
-    
-        short_code = getString()
-        
-        while db.query(database_models.Links).filter(
-            database_models.Links.short_code == short_code).first():
-            short_code = getString() 
-        
-        title = await fetch_title(str(link.original_url))
-        link_model = database_models.Links(
-        original_url = str(link.original_url), user_id = user_id, 
-        title = title, short_code = short_code, alias = None,
-        created_at=timestamp, short_url = API_URL + short_code)
-    
-
-    db.add(link_model)
-    db.commit()
-    add_link_to_user(user_id, link_model.id, link.title if link.title else title, db)
-    db.refresh(link_model)
-
-    return link_model
-```
-
-The `create_short_link_for_user` function is refractored for use in the WebSocket.
 
 ---
 
@@ -249,43 +166,226 @@ The `create_short_link_for_user` function is refractored for use in the WebSocke
 
 - **302 redirect** to the full original URL.
 
-**Code**
+---
+
+### 3. `GET /links` — List current user’s links
+
+Returns all links associated with the authenticated user.
+
+**Auth required**: Yes  
+
+**Response 200**
 
 ```py
-#ShortToLong. This endpoint is the last one to avoid conflict with other /links/ endpoints
-@router.get("/{key}")
-def go_to_link( db: db_dependency, key:str, redis: Redis = Depends(get_redis)):
+[
+  {
+    "user_link_id": 10,
+    "id": 1,
+    "short_code": "a1b2c3",
+    "alias": "my-custom-alias",
+    "short_url": "localhost:8000/a1b2c3",
+    "original_url": "https://example.com",
+    "title": "Custom title for me",
+    "default_title": "Fetched page title",
+    "tags": [],
+    "clicks": 12,
+    "created_at": "2025-11-25T18:00:00+00:00"
+  }
+]
+```
+---
 
-    cache_key = link_key(key) 
-    cached_link = redis.get(cache_key)
-    if cached_link:
-        data = json.loads(cast(str, cached_link))
-        # Update clicks in cache
-        data['clicks'] += 1
-        redis.set(cache_key, json.dumps(data), ex=CACHE_TTL_SECONDS) 
-        redis.incr(click_counter_key(data['id']))  
-        redis.sadd(DIRTY_SET_KEY, data['id'])  
+### 4. `DELETE /by_url/` — Delete link by original URL
 
-        return RedirectResponse(data['original_url']) 
-    
-    db_link = db.query(database_models.Links).filter(
-        (database_models.Links.short_code == key)|
-        (database_models.Links.alias == key)).first()
-    
-    if not db_link:
-        raise HTTPException(404,"Link not found")
+Deletes a link belonging to the user using with matching URL. Currently unused.
 
-    cache_key = link_key(key)#  
-    data = link_to_dict(db_link)
-    # Update cache
-    redis.set(cache_key, json.dumps(data), ex=CACHE_TTL_SECONDS)
-    redis.incr(click_counter_key(db_link.id))  #
-    redis.sadd(DIRTY_SET_KEY, db_link.id)  #
-    #delete cache for user links list
-    if db_link.user_id: #  
-        redis.delete(links_user(db_link.user_id))  #  
+**Auth required**: Yes  
 
-    return RedirectResponse(db_link.original_url) #  
+**Query param:** `url`
+
+**Response 200**
+
+```py
+"Link deleted"
+```
+
+---
+
+### 5. `DELETE /by_key/` — Delete link by short_code or alias
+
+Deletes a link belonging to the user using with matching short code or alias.
+
+**Auth required**: Yes  
+
+**Query param:** `key`
+
+**Response 200**
+
+```py
+"Link deleted"
+```
+
+---
+
+### 6. `GET /link/title/` — Fetch page title for a URL
+
+Web crawler using BeautifulSoup to automatically fetch the title after inputting the URL. Also sets the default title of the Link in the database. Returns `Failed to Fetch Title` if the website rejects.
+
+**Auth required**: Yes  
+
+**Query param:** `url`
+
+**Response 200**  
+Plain text:
+
+Examples:
+
+- `"My Page Title"`
+- `"Failed to Fetch Title"`
+- `"No Title"`
+
+---
+
+### 7. `GET /links/qrcode/` — Get QR code for a short link
+
+Generates a QR code for a given Link using its short code or alias
+
+**Auth required**: Yes  
+
+**Query param:** `key`
+
+**Response 200**
+
+- PNG image (`image/png`)
+
+---
+
+# WebSocket API
+
+### `WS /ws/batch-upload/` — Batch link upload
+
+Opens a WebSocket for batch uploading of links.
+
+**Auth required**: Yes
+
+---
+
+### Client → Server messages
+
+---
+
+#### 1. `start`
+
+```py
+{
+  "type": "start",
+  "total": 3
+}
+```
+
+**Server response**
+
+```py
+{
+  "type": "started",
+  "total": 3
+}
+```
+
+---
+
+#### 2. `item`
+
+```py
+{
+  "type": "item",
+  "data": {
+    "alias": "batch-1",
+    "title": "Batch link 1",
+    "original_url": "https://example.com/1"
+  }
+}
+```
+
+**Possible server responses**
+
+Successful item:
+
+```py
+{
+  "type": "item_result",
+  "index": 1,
+  "status": "ok",
+  "id": 10,
+  "short_url": "localhost:8000/batch-1",
+  "short_code": null,
+  "alias": "batch-1"
+}
+```
+
+Business logic error:
+
+```py
+{
+  "type": "item_result",
+  "index": 1,
+  "status": "error",
+  "code": 409,
+  "detail": "You already have a link for this URL."
+}
+```
+
+Unexpected error:
+
+```py
+{
+  "type": "item_result",
+  "index": 1,
+  "status": "error",
+  "code": 500,
+  "detail": "Some error"
+}
+```
+
+Optional progress message:
+
+```py
+{
+  "type": "progress",
+  "processed": 1,
+  "total": 3
+}
+```
+
+---
+
+#### 3. `finish`
+
+```py
+{
+  "type": "finish"
+}
+```
+
+**Server response**
+
+```py
+{
+  "type": "finished",
+  "processed": 3,
+  "total": 3
+}
+```
+
+---
+
+#### 4. Unknown message types
+
+```py
+{
+  "type": "error",
+  "detail": "Unknown message type: <value>"
+}
 ```
 
 ---

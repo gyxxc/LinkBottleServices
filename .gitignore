@@ -8,6 +8,8 @@ frontend/
 *.so
 
 # Distribution / packaging
+alembic/
+alembic.ini
 .Python
 build/
 develop-eggs/

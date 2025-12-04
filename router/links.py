@@ -142,7 +142,7 @@ def get_link_qrcode(user: user_dependency, db: db_dependency, key:str, redis: Re
         data = link_to_dict(db_link)
         redis.set(cache_key, json.dumps(data), ex=CACHE_TTL_SECONDS)
     
-    qr_code_img = generate_qr_code('http://'+ data['short_url'])
+    qr_code_img = generate_qr_code(data['original_url'])
 
     # Cache the QR code image in base64
     qr_code_base64 = base64.b64encode(qr_code_img.getvalue()).decode('ascii')
