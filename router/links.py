@@ -43,7 +43,8 @@ class LinkUpdateRequest(BaseModel):
     class Config:
         json_schema_extra = {
             'example': {
-                'title': 'New Link Title'
+                'title': 'New Link Title',
+                'tags': ['tag1', 'tag2']
             }
         }
 #------------------------------------

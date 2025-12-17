@@ -104,28 +104,6 @@ class userLinks(Base):
     _unique_constraint_ = ('user_id', 'link_id')
 ```
 
-### `LinkRequest` (request body schema)
-
-Used for creating and updating links.
-
-| Field        | Type     | Required | Description                                                                                          |
-|-------------|----------|----------|------------------------------------------------------------------------------------------------------|
-| `alias`     | string   | No       | Optional custom alias. 3–30 chars, only letters, digits, `_` or `-`.                                |
-| `title`     | string   | No       | Optional human-readable title for the link.                                                         |
-| `original_url` | URL   | **Yes**  | Original target URL. Must be a valid HTTP/HTTPS URL.                                                |
-
-Example:
-
-```py
-{
-  "alias": "my-custom-alias",
-  "title": "My Example Link",
-  "original_url": "https://example.com/resource"
-}
-```
-
-
-
 ---
 
 ## Endpoints
@@ -134,7 +112,7 @@ Example:
 
 ### 1. `POST /shorten/` — Create a new short link (LongToShort)
 
-Creates a new shortened URL for the authenticated user, with optional custom alias.
+Creates a new shortened URL for the authenticated user, with optional custom alias. User can set if a QR code is generated alongside and stored in AWS S3.
 
 **Auth required**: Yes  
 
@@ -144,7 +122,8 @@ Creates a new shortened URL for the authenticated user, with optional custom ali
 {
   "alias": "my-custom-alias",
   "title": "My Example Link",
-  "original_url": "https://example.com"
+  "original_url": "https://example.com",
+  "generate_qr": True
 }
 ```
 
@@ -161,6 +140,7 @@ Creates a new shortened URL for the authenticated user, with optional custom ali
   "short_url": "localhost:8000/my-custom-alias",
   "clicks": 0,
   "created_at": "2025-11-25T18:00:00+00:00"
+  "qr_code_path": "https://AWS_BUCKET_NAME.s3.AWS_REGION.amazonaws.com/my-custom-alias.png"
 }
 ```
 
@@ -198,7 +178,8 @@ Returns all links associated with the authenticated user.
     "default_title": "Fetched page title",
     "tags": [],
     "clicks": 12,
-    "created_at": "2025-11-25T18:00:00+00:00"
+    "created_at": "2025-11-25T18:00:00+00:00",
+    "qr_code_path": "https://AWS_BUCKET_NAME.s3.AWS_REGION.amazonaws.com/my-custom-alias.png"
   }
 ]
 ```
@@ -248,15 +229,46 @@ Examples:
 
 ### 7. `GET /links/qrcode/` — Get QR code for a short link
 
-Generates a QR code for a given Link using its short code or alias
+Generates a QR code for a given Link using its short code or alias, then stores it in AWS S3.
+
+**Auth required**: Yes  
+
+**Path param:** `key`
+
+
+
+**Response 200**
+
+```py
+
+{
+  'qr_code_path': "https://AWS_BUCKET_NAME.s3.AWS_REGION.amazonaws.com/my-custom-alias.png"
+}
+
+```
+
+---
+
+### 7. `PUT /links/{key}/` — Update Link customization
+
+Updates the Custom Title and Tags of a link for a user.
 
 **Auth required**: Yes  
 
 **Query param:** `key`
 
-**Response 200**
+**Request body (JSON)**
 
-- PNG image (`image/png`)
+```py
+{
+  'title': 'New Link Title',
+  'tags': ['tag1', 'tag2']
+}
+```
+
+**Response 202**
+
+- `"Link updated"`
 
 ---
 
