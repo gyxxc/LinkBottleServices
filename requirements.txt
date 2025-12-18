@@ -13,3 +13,7 @@ redis
 qrcode[pil]
 authlib
 itsdangerous
+requests
+openai
+boto3
+pydantic[email]

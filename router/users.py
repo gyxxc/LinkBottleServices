@@ -20,8 +20,23 @@ def get_db():
     finally:
         db.close()
 
+def user_to_dict(user: Users) -> dict:
+    return {
+        "id": user.id,
+        "email": user.email,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "is_active": user.is_active,
+        "role": user.role,
+        "phone_number": user.phone_number,
+        "has_password": user.hashed_password is not None,
+        "has_google_auth": user.google_sub is not None,
+        "has_github_auth": user.github_id is not None,
+    }
+
 db_dependency = Annotated[Session, Depends(get_db)]
-user_dependency = Annotated[dict,Depends(get_current_user)]
+user_dependency = Annotated[dict, Depends(get_current_user)]
 bcrypt_context = CryptContext(schemes=['bcrypt'],deprecated = 'auto')
 
 class UserVerification(BaseModel):
@@ -33,7 +48,8 @@ class UserVerification(BaseModel):
 async def get_user(user:user_dependency, db:db_dependency):
     if not user:
         raise HTTPException(401, detail='Authentication Failed.')
-    return db.query(Users).filter(Users.id == user.get('id')).first()
+    db_user = db.query(Users).filter(Users.id == user.get('id')).first()
+    return user_to_dict(db_user)  # type: ignore
 
 @router.put("/password",status_code=status.HTTP_202_ACCEPTED)
 async def change_password(user:user_dependency, db:db_dependency, 

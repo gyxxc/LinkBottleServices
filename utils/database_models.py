@@ -33,6 +33,7 @@ class Links(Base):
     short_url =  mapped_column(String, unique=True, nullable=False)
     created_at =  mapped_column(TIMESTAMP)
     clicks =  mapped_column(Integer, default=0)
+    qr_code_path =  mapped_column(String, nullable=True)
     
 
 class userLinks(Base):
@@ -42,6 +43,7 @@ class userLinks(Base):
     id =  mapped_column(Integer, primary_key=True, index=True)
     user_id =  mapped_column(Integer, ForeignKey('users.id', ondelete="CASCADE"), nullable=False, index=True)
     link_id =  mapped_column(Integer, ForeignKey('links.id', ondelete="CASCADE"), nullable=False, index=True)
+    key = mapped_column(String, unique=False, nullable=False)
     title =  mapped_column(String)
     tags =  mapped_column(ARRAY(String))
 

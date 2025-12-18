@@ -15,7 +15,8 @@ import httpx
 import json
 import base64
 import io
-from utils.qrcode import generate_qr_code
+from utils.AWShelper import generate_qr_code, upload_qr_to_s3
+from security.safebrowsing import check_url_with_google_safe_browsing, classify_url_with_openai
 
 from pydantic import BaseModel, HttpUrl, Field, constr
 class LinkRequest(BaseModel):
@@ -23,15 +24,29 @@ class LinkRequest(BaseModel):
         description="Optional alias of 3–30 chars containing only letters, numbers, _ or -",)
     title: Optional[str] = None
     original_url: HttpUrl # validates http/https
+    generate_qr: Optional[bool] = False
 
     class Config:
         json_schema_extra = {
             'example': {
                 'alias': 'your-custom-alias',
                 'title': 'Title (Optional)',
-                'original_url': 'http://example.com/resource'
+                'original_url': 'http://example.com/resource',
+                'generate_qr': True
             }
         } 
+
+class LinkUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    tags: Optional[list[str]] = None
+
+    class Config:
+        json_schema_extra = {
+            'example': {
+                'title': 'New Link Title',
+                'tags': ['tag1', 'tag2']
+            }
+        }
 #------------------------------------
 API_URL = "localhost:8000/"
 
@@ -50,6 +65,7 @@ def link_to_dict(link: database_models.Links) -> dict:
         "short_url": link.short_url,
         "clicks": link.clicks,
         "created_at": link.created_at.isoformat() if link.created_at else None,
+        "qr_code_path": link.qr_code_path,
     }
 
 def getString():
@@ -116,16 +132,30 @@ def get_link_qrcode(user: user_dependency, db: db_dependency, key:str, redis: Re
         raise HTTPException(401, detail='Authentication Failed.')
     
     key = key.replace("http://","").replace("https://","").replace(API_URL,"")
-    user_id = user.get('id')
-    assert user_id is not None
 
-    qr_cache_key = link_qr_key(key)
-    cached_qr = redis.get(qr_cache_key)
-    if cached_qr:
-        qr_code_data = base64.b64decode(cast(str, cached_qr))
-        return StreamingResponse(io.BytesIO(qr_code_data), media_type="image/png")
+    db_link = db.query(database_models.Links).filter(
+        (database_models.Links.short_code == key)|
+        (database_models.Links.alias == key)).first()
+    if not db_link: 
+        raise HTTPException(404,"Link not found")
+    
+    qr_code_img = generate_qr_code(f"http://{API_URL}{key}")
+    qr_s3_url = upload_qr_to_s3(key, qr_code_img.getvalue())
+    db_link.qr_code_path = qr_s3_url
+    db.commit()
 
+    redis.set(link_qr_key(key), qr_code_img.getvalue(), ex=QR_CACHE_TTL_SECONDS)
+    redis.delete(links_user(user.get('id'))) #type: ignore
+    return {'qr_code_path': qr_s3_url}
+    
+#ShortToLong. This endpoint is the last one to avoid conflict with other /links/ endpoints
+@router.get("/{key}")
+def go_to_link( db: db_dependency, key:str, redis: Redis = Depends(get_redis)):
 
+    data = get_link_by_key(db, redis, key, update_clicks=True)
+    return RedirectResponse(url=data['original_url'])
+
+def get_link_by_key(db, redis, key: str, update_clicks: bool = False):
     cache_key = link_key(key) 
     cached_link =  redis.get(cache_key)
     if cached_link:
@@ -140,52 +170,20 @@ def get_link_qrcode(user: user_dependency, db: db_dependency, key:str, redis: Re
 
         data = link_to_dict(db_link)
         redis.set(cache_key, json.dumps(data), ex=CACHE_TTL_SECONDS)
-    
-    qr_code_img = generate_qr_code(data['original_url'])
-
-    # Cache the QR code image in base64
-    qr_code_base64 = base64.b64encode(qr_code_img.getvalue()).decode('ascii')
-    redis.set(qr_cache_key, qr_code_base64, ex=QR_CACHE_TTL_SECONDS)
-
-    return StreamingResponse(qr_code_img, media_type="image/png")
-
-    
-#ShortToLong. This endpoint is the last one to avoid conflict with other /links/ endpoints
-@router.get("/{key}")
-def go_to_link( db: db_dependency, key:str, redis: Redis = Depends(get_redis)):
-
-    cache_key = link_key(key) 
-    cached_link = redis.get(cache_key)
-    if cached_link:
-        data = json.loads(cast(str, cached_link))
-        # Update clicks in cache
+    if update_clicks:
         data['clicks'] += 1
         redis.set(cache_key, json.dumps(data), ex=CACHE_TTL_SECONDS) 
         redis.incr(click_counter_key(data['id']))  
-        redis.sadd(DIRTY_SET_KEY, data['id'])  
+        redis.sadd(DIRTY_SET_KEY, data['id'])
 
-        return RedirectResponse(data['original_url']) 
-    
-    db_link = db.query(database_models.Links).filter(
-        (database_models.Links.short_code == key)|
-        (database_models.Links.alias == key)).first()
-    
-    if not db_link:
-        raise HTTPException(404,"Link not found")
+    return data
 
-    cache_key = link_key(key)#  
-    data = link_to_dict(db_link)
-    # Update cache
-    redis.set(cache_key, json.dumps(data), ex=CACHE_TTL_SECONDS)
-    redis.incr(click_counter_key(db_link.id))  #
-    redis.sadd(DIRTY_SET_KEY, db_link.id)  #
-    #delete cache for user links list
-
-    return RedirectResponse(db_link.original_url) #  
-    
 #LongToShort
 @router.post("/shorten/",status_code = status.HTTP_201_CREATED)
 async def shorten_link(user: user_dependency, db: db_dependency, link: LinkRequest, redis: Redis = Depends(get_redis)):
+    if not user:
+        raise HTTPException(401, detail='Authentication Failed.')
+    
     link_model = await create_link_for_user(db, user, link)
 
     data = link_to_dict(link_model)
@@ -200,23 +198,35 @@ async def shorten_link(user: user_dependency, db: db_dependency, link: LinkReque
 
     return data
 
+async def link_safety_check(url: str):
+    threat = await check_url_with_google_safe_browsing(url)
+    if threat:
+        raise HTTPException(400, detail="The provided URL is flagged as unsafe.")
+    
+    classify = await classify_url_with_openai(url)
+    category = classify["category"]
+
+    if category in ("spam", "scam_or_phishing", "extremely_high_risk"):
+        raise HTTPException(400, detail="The provided URL is flagged as spam or unsafe.")
+
 async def create_link_for_user(db: Session, user, link: LinkRequest) -> database_models.Links:
     user_id = user.get('id')
     if not user_id:
         raise HTTPException(401, detail='Authentication Failed.')
 
     timestamp = datetime.now(timezone.utc)
+    long_url = str(link.original_url)
     
     #check for existing link with same URL
     link_check = db.query(database_models.Links).filter(
-        database_models.Links.original_url == str(link.original_url)).first()
+        database_models.Links.original_url == long_url).first()
     if link_check:
         user_link_check = db.query(database_models.userLinks).filter(
             database_models.userLinks.user_id == user_id,
             database_models.userLinks.link_id == link_check.id,
         ).first()
         if user_link_check:
-            raise HTTPException(409,detail="You already have a link for this URL.")
+            return link_check  # User already has this link
 
     if link.alias: #custom alias provided
         
@@ -224,25 +234,29 @@ async def create_link_for_user(db: Session, user, link: LinkRequest) -> database
                 (database_models.Links.short_code == link.alias)|
                 (database_models.Links.alias == link.alias)).first()
         if link_check:
-            if str(link.original_url) != link_check.original_url:
+            if long_url != link_check.original_url:
                 raise HTTPException(409,detail="A different Link already uses this alias.")
             #same link already exists for different user, just link it to this user
-            add_link_to_user(user_id, link_check.id, link.title if link.title else link_check.title, db)
+            add_link_to_user(user_id, link_check.id, link.alias,
+                             link.title if link.title else link_check.title, db)
             return link_check
         
-        title = await fetch_title(str(link.original_url))
+        await link_safety_check(long_url)
+        title = await fetch_title(long_url)
         link_model = database_models.Links(
-        original_url = str(link.original_url), 
+        original_url = long_url, 
         title = title, short_code = None, alias = link.alias,
         created_at=timestamp, short_url = API_URL + link.alias)
     
     else: #no custom alias
         #check for existing link with same URL
         link_check = db.query(database_models.Links).filter(
-            database_models.Links.original_url == str(link.original_url)).first()
+            database_models.Links.original_url == long_url, 
+            database_models.Links.short_code != None).first()
         if link_check:
             #same link already exists for different user, just link it to this user
-            add_link_to_user(user_id, link_check.id, link.title if link.title else link_check.title, db)
+            add_link_to_user(user_id, link_check.id, link_check.short_code,
+                             link.title if link.title else link_check.title, db)
             return link_check
     
         short_code = getString()
@@ -251,57 +265,51 @@ async def create_link_for_user(db: Session, user, link: LinkRequest) -> database
             database_models.Links.short_code == short_code).first():
             short_code = getString() 
         
-        title = await fetch_title(str(link.original_url))
+        await link_safety_check(long_url)
+        title = await fetch_title(long_url)
         link_model = database_models.Links(
-        original_url = str(link.original_url), 
+        original_url = long_url, 
         title = title, short_code = short_code, alias = None,
         created_at=timestamp, short_url = API_URL + short_code)
     
-
+    key = link_model.short_code if link_model.short_code else link_model.alias
+    if link.generate_qr and not link_model.qr_code_path:
+        #generates QR code and uploads to AWS S3
+        qr_code_img = generate_qr_code(f"http://{API_URL}{key}")
+        qr_s3_url = upload_qr_to_s3(key, qr_code_img.getvalue())
+        link_model.qr_code_path = qr_s3_url
     db.add(link_model)
     db.commit()
-    add_link_to_user(user_id, link_model.id, link.title if link.title else title, db)
+    add_link_to_user(user_id, link_model.id, key,
+                     link.title if link.title else title, db)
     db.refresh(link_model)
 
     return link_model
 
 
-# @router.put("/links/",status_code = status.HTTP_202_ACCEPTED)
-# def update_link(user: user_dependency, db: db_dependency, 
-#                    link:LinkRequest, key:str, redis: Redis = Depends(get_redis)):
-#     if not user:
-#         raise HTTPException(401, detail='Authentication Failed.')
+@router.put("/links/{key}/",status_code = status.HTTP_202_ACCEPTED)
+def update_link(user: user_dependency, db: db_dependency, 
+                   update:LinkUpdateRequest, key:str, redis: Redis = Depends(get_redis)):
+    if not user:
+        raise HTTPException(401, detail='Authentication Failed.')
     
-#     key = key.replace("http://","").replace("https://","").replace(API_URL,"")
-#     user_id = user.get('id')
-#     assert user_id is not None
-#     db_link = db.query(database_models.Links).filter(
-#         database_models.Links.short_code == key).first()
-#     if db_link:
-#         link_check = db.query(database_models.Links).filter(
-#             (database_models.Links.alias == link.alias)|(database_models.Links.short_code == link.alias)
-#             |(database_models.Links.original_url == str(link.original_url))), 
-#             database_models.Links.id != db_link.id
-#             ).first()
-#         if link_check:
-#             raise HTTPException(409,detail="Another link with same alias or URL already exists.")
+    key = key.replace("http://","").replace("https://","").replace(API_URL,"")
+    user_id = user.get('id')
+    assert user_id is not None
+    db_link = db.query(database_models.userLinks).filter(
+        database_models.userLinks.key == key, 
+        database_models.userLinks.user_id == user_id).first()
+    if not db_link:
+        raise HTTPException(404,"Link not found for this user")
+    if update.title is not None:
+        db_link.title = update.title
+    if update.tags is not None:
+        db_link.tags = update.tags
+    db.commit()
 
-#         db_link.title = link.title if link.title else db_link.title
-#         db_link.alias = link.alias if link.alias else db_link.alias
-#         db_link.original_url = str(link.original_url)
-#         db.commit()
-#         db.refresh(db_link)
-  
-#         cache_key = link_key(db_link.short_code) 
-#         data = link_to_dict(db_link)
-#         # Invalidate caches
-#         redis.delete(links_user(user_id))
-#         # Populate single-link cache
-#         redis.set(cache_key, json.dumps(data), ex=CACHE_TTL_SECONDS)
-
-#         return "Link Updated"
-#     #return "Link not found"
-#     raise HTTPException(404,"Link not found")
+    # Invalidate caches
+    redis.delete(links_user(user_id)) 
+    return "Link updated"
 
 @router.delete("/by_key/",status_code=status.HTTP_200_OK)
 async def delete_link_by_key(user: user_dependency, key:str, db:Session = Depends(get_db), redis: Redis = Depends(get_redis)):
@@ -350,6 +358,17 @@ async def get_link_title(user: user_dependency, url: str):
     if not user:
         raise HTTPException(401, detail='Authentication Failed.')
     
+    # threat = check_url_with_google_safe_browsing(url)
+    # if threat:
+    #     return Response(content="The provided URL is flagged as unsafe" , media_type="text/plain")
+    
+    # classify = classify_url_with_openai(url)
+    # category = classify["category"]
+
+    # if category in ("spam", "scam_or_phishing", "extremely_high_risk"):
+    #     return Response(content="The provided URL is flagged as spam or unsafe" ,
+    #                      media_type="text/plain")
+    
     return Response(content=await fetch_title(url) , media_type="text/plain")
 
 async def fetch_title(url: str) -> str:
@@ -383,18 +402,18 @@ async def ws_batch_upload(websocket: WebSocket, db: Session = Depends(get_db), r
             token = token.split(" ", 1)[1]
 
     if not token:
-        await websocket.close(code=1008, reason="Missing token")
+        await websocket.close(code=1008, reason="Authentication failed")
         return
 
     try:
         user = decode_user_from_token(token)  # already returns username/id/role
     except HTTPException:
-        await websocket.close(code=1008, reason="Invalid token")
+        await websocket.close(code=1008, reason="Authentication failed")
         return
 
     user_id = user["id"]
     if not user_id:
-        await websocket.close(code=1008, reason="Invalid user id")
+        await websocket.close(code=1008, reason="Authentication failed")
         return
 
     await websocket.accept()
@@ -470,6 +489,15 @@ async def ws_batch_upload(websocket: WebSocket, db: Session = Depends(get_db), r
                 })
                 await websocket.close()
                 return
+            
+            elif mtype == "cancel":
+                await websocket.send_json({
+                    "type": "cancelled",
+                    "processed": processed,
+                    "total": total,
+                })
+                await websocket.close()
+                return
 
             else:
                 # Unknown message type
@@ -483,10 +511,11 @@ async def ws_batch_upload(websocket: WebSocket, db: Session = Depends(get_db), r
         return
         
 
-def add_link_to_user(user_id: int, link_id: int, title: str, db: db_dependency):
+def add_link_to_user(user_id: int, link_id: int, key: str, title: str, db: db_dependency):
     user_link = database_models.userLinks(
         user_id=user_id,
         link_id=link_id,
+        key=key,
         title=title
     )
     db.add(user_link)
@@ -508,4 +537,5 @@ def user_link_view_dict(
         "tags": ul.tags or [],
         "clicks": link.clicks,
         "created_at": link.created_at.isoformat() if link.created_at else None,
+        "qr_code_path": link.qr_code_path,
     }

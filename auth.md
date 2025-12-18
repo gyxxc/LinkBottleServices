@@ -6,76 +6,15 @@ Base router prefix: **`/auth`**
 
 ---
 
-# Data Models
-
-## UserRequest (for email/password signup)
-
-| Field        | Type     | Required | Notes |
-|--------------|----------|----------|-------|
-| id           | int?     | No       | Ignored on signup |
-| username     | string   | Yes      | 3–30 chars; letters, numbers, `_` and `-` |
-| email        | string   | Yes      | Must be unique |
-| first_name   | string?  | No       |
-| last_name    | string?  | No       |
-| password     | string   | Yes      | Minimum length: 8 |
-| phone_number | string?  | No       |
-
-Example:
-```
-{
-  "username": "username",
-  "email": "username@gmail.com",
-  "first_name": "first name",
-  "last_name": "last name",
-  "password": "password",
-  "phone_number": "1234567890"
-}
-```
-
----
-
-## CompleteSignupBody
-
-Used after OAuth signup when user must pick a username.
-
-| Field         | Type   | Required |
-|---------------|--------|----------|
-| pending_token | string | Yes      |
-| username      | string | Yes      |
-
----
-
-## BindAccountBody
-
-Used when a user signs in with OAuth but the email already exists and must verify password to link.
-
-| Field         | Type   |
-|---------------|--------|
-| pending_token | string |
-| password      | string |
-
----
-
-## Token (Response)
-
-The authentication token issued after a successful sign-in.
-
-```
-{
-  "access_token": "string",
-  "token_type": "bearer"
-}
-```
-
----
-
 # Authentication Flow Overview
 
-There are three authentication modes:
+There are two authentication modes:
 
 ---
 
-## 1. Username + Password Login
+# 1. Local Account (OTP Required for Signup)
+
+## Username + Password Login
 
 ### **POST /auth/token**
 
@@ -101,16 +40,93 @@ Form Fields:
 
 ---
 
-## 2. Email/Password Signup (Local Account)
+## Request OTP Code
 
-### **POST /auth/**
+### **GET /auth/otp/get-code/**
 
-Creates a new user.
+Generates and sends a one-time passcode to the provided email.
 
-### Request Body
-UserRequest schema.
+OTP is used for:
+- Email verification during signup
+- Changing password (authenticated)
+- Forgot password (unauthenticated)
+
+OTP codes:
+- Are numeric
+- Length: 6 digits
+- Stored in Redis
+- Have resend cooldown (`CODE_RESEND_SECONDS`)
+- Are invalidated after successful verification
+
+**Auth required:** No  
+
+**Query Parameters**
+
+| Name  | Type  | Required |
+|------|-------|----------|
+| email | Email | Yes |
+
+### Behavior
+- If a valid OTP was sent recently → request is rejected
+- Otherwise:
+  - Generate 6-digit numeric OTP
+  - Store it in Redis
+  - Send via email (AWS SES)
+  - Return code (temporary dev behavior)
+
+### Response 200
+
+```
+{
+  "detail": "OTP code generated and sent.",
+  "code": "123456"
+}
+```
+
+### Errors
+- `400 A code has already been sent recently.`
+
+---
+
+## Create User (OTP Verified)
+
+### **POST /auth/create_user/**
+
+Creates a new local user account after OTP verification.
+
+**Auth required:** No  
+
+### Request Body — UserRequest (extended)
+
+| Field        | Type   | Required |
+|-------------|--------|----------|
+| username    | string | Yes |
+| email       | string | Yes |
+| password    | string | Yes |
+| otp         | string | Yes |
+| first_name  | string | No |
+| last_name   | string | No |
+| phone_number| string | No |
+
+Example:
+
+```
+{
+  "username": "newuser",
+  "email": "newuser@example.com",
+  "password": "strongpassword",
+  "otp": "123456"
+}
+```
+
+### Flow
+1. Verify OTP against Redis
+2. Check username uniqueness
+3. Check email uniqueness
+4. Create user with hashed password
 
 ### Response 201
+
 ```
 "User Created"
 ```
@@ -118,10 +134,112 @@ UserRequest schema.
 ### Errors
 - `400 Username already taken`
 - `400 E-mail already taken`
+- `400 Invalid or expired OTP`
 
 ---
 
-# OAuth Authentication (Google + GitHub)
+## Change Password (Authenticated)
+
+### **POST /auth/change-password**
+
+Allows a logged-in user to change their password using OTP verification.
+
+**Auth required:** Yes  
+
+### Headers
+
+```
+Authorization: Bearer <access_token>
+```
+
+### Request Body — ChangePasswordRequest
+
+| Field        | Type   | Required |
+|-------------|--------|----------|
+| new_password| string | Yes |
+| otp         | string | Yes |
+| old_password| string | Conditional |
+
+- `old_password` is required **if** user already has a password
+
+Example:
+
+```
+{
+  "old_password": "oldpassword",
+  "new_password": "newpassword",
+  "otp": "123456"
+}
+```
+
+### Flow
+1. Validate access token
+2. Verify OTP for user email
+3. Verify old password (if exists)
+4. Hash and update password
+
+### Response 202
+
+```
+"Password Changed"
+```
+
+### Errors
+- `401 Authentication Failed`
+- `401 Old password did not match`
+- `400 Old password is required`
+- `400 Invalid or expired OTP`
+
+---
+
+## Forgot Password (Unauthenticated)
+
+### **POST /auth/forget-password**
+
+Resets password using OTP without requiring login.
+
+**Auth required:** No  
+
+### Query Parameters
+
+| Name  | Type  | Required |
+|------|-------|----------|
+| email | Email | Yes |
+
+### Request Body — ChangePasswordRequest
+
+| Field        | Type   | Required |
+|-------------|--------|----------|
+| new_password| string | Yes |
+| otp         | string | Yes |
+
+Example:
+
+```
+{
+  "new_password": "newpassword",
+  "otp": "123456"
+}
+```
+
+### Flow
+1. Locate user by email
+2. Verify OTP
+3. Replace password with hashed value
+
+### Response 202
+
+```
+"Password Changed"
+```
+
+### Errors
+- `404 User not found`
+- `400 Invalid or expired OTP`
+
+---
+
+# 2. OAuth Authentication (Google + GitHub)
 
 OAuth uses **redirects**, a **pending token**, and multiple states:
 
@@ -134,7 +252,7 @@ Frontend receives callback with URL parameters specifying the flow.
 
 ---
 
-## 3. Google OAuth
+## Google OAuth
 
 ### **GET /auth/google/login**
 
@@ -162,7 +280,7 @@ Returned redirect URL includes parameters such as:
 
 ---
 
-## 4. GitHub OAuth
+## GitHub OAuth
 
 ### **GET /auth/github/login**
 
@@ -201,7 +319,7 @@ Returned to frontend via:
 
 # Post-OAuth Endpoints
 
-## 5. Complete OAuth Signup
+## Complete OAuth Signup
 
 ### **POST /auth/complete-signup**  
 (Request Body: CompleteSignupBody)
@@ -222,7 +340,7 @@ Used when OAuth user has no existing account and must create one by choosing use
 
 ---
 
-## 6. Bind Existing Account to OAuth Provider
+## Bind Existing Account to OAuth Provider
 
 ### **POST /auth/bind-account**  
 (Request Body: BindAccountBody)

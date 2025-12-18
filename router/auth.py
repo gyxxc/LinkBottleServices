@@ -1,22 +1,26 @@
-from typing import Optional, Annotated
+from typing import Optional, Annotated, Dict, Any, cast
 from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from utils import database_models
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
-from utils.database import sessionLocal, engine
+from utils.database import sessionLocal, engine, Redis, get_redis
 from starlette import status
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from datetime import timedelta,datetime,timezone
 from jose import jwt, JWTError
 from authlib.integrations.starlette_client import OAuth
 import os
+import random
+import hmac
+import hashlib
+import json
+from utils.AWShelper import send_email
 
 class UserRequest(BaseModel):
 
-    id: Optional[int] = None
     username: str = Field(min_length=3, max_length=30,
         pattern=r"^[A-Za-z0-9_-]{3,30}$",
         description="Username of 3–30 chars containing only letters, numbers, _ or -",)
@@ -25,6 +29,9 @@ class UserRequest(BaseModel):
     last_name: Optional[str] = None
     password: str = Field(min_length=8)
     phone_number: Optional[str] = None
+    otp: str = Field(min_length=6, max_length=6,
+        pattern=r"^[0-9]{6}$",
+        description="6 digit one time password",)
 
     class Config:
         json_schema_extra = {
@@ -34,7 +41,8 @@ class UserRequest(BaseModel):
                 'first_name': 'first name',
                 'last_name': 'last name',
                 'password': 'password',
-                'phone_number': '1234567890'
+                'phone_number': '1234567890',
+                'otp': '123456'
             }
         } 
 
@@ -52,6 +60,13 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
+class ChangePasswordRequest(BaseModel):
+    old_password: Optional[str] = None
+    new_password: str = Field(min_length=8)
+    otp: str = Field(min_length=6, max_length=6,
+        pattern=r"^[0-9]{6}$",)
+
+
 bcrypt_context = CryptContext(schemes=['bcrypt'],deprecated = 'auto')
 oauth2_bearer = OAuth2PasswordBearer(tokenUrl='auth/token')
 
@@ -60,6 +75,10 @@ ALGORITHM = 'HS256'
 ACCESS_EXPIRE_TIME = 20
 PENDING_EXPIRE_TIME = 10
 FRONTEND_URL = "http://localhost:3000"
+PROVIDER_SECRET_SALT = os.getenv('PROVIDER_SECRET_SALT', 'another-secret-salt')
+CODE_TTL_SECONDS = 300  
+CODE_RESEND_SECONDS = 60
+MAX_ATTEMPTS = 5  
 
 router = APIRouter(
     prefix='/auth',
@@ -132,13 +151,60 @@ init_db()
 
 db_dependency = Annotated[Session, Depends(get_db)]
 
+def generate_numeric_code(length: int = 6) -> str:
+    return "".join(str(random.randint(0, 9)) for _ in range(length))
+
+def _load_verification(redis: Redis, key: str) -> Optional[Dict[str, Any]]:
+    raw = redis.get(key)
+    if not raw:
+        return None
+    return json.loads(cast(str,raw))
+
+def _increment_attempts(redis: Redis, key: str, verification: Dict[str, Any]) -> None:
+    verification["attempts"] += 1
+    redis.setex(key, CODE_TTL_SECONDS, json.dumps(verification))
+
+def create_verification_entry(
+    redis: Redis,
+    key: str,
+    code: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "code": bcrypt_context.hash(code),
+        "attempts": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra:
+        payload.update(extra)
+    redis.setex(key, CODE_TTL_SECONDS, json.dumps(payload))
+
+def verify_otp_code(email, otp, redis: Redis):
+    key = f"otp:{email}"
+    verification = _load_verification(redis, key)
+    if not verification:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="No OTP code found. Please request a new code.")
+    if verification["attempts"] >= MAX_ATTEMPTS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Maximum verification attempts exceeded.")
+    if not bcrypt_context.verify(otp, verification["code"]):
+        _increment_attempts(redis, key, verification)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid OTP code.")
+    redis.delete(key)
+
+
 def authenticate_user(username: str, password: str, db:Session):
     user = db.query(database_models.Users).filter(
-        database_models.Users.username == username).first()
+        (database_models.Users.username == username)|
+        (database_models.Users.email == username)).first()
     if user:
         if bcrypt_context.verify(password, user.hashed_password): # type: ignore
             return user
     return False
+
+def hash_provider_id(provider: str, provider_id: str) -> str:
+    msg = f"{provider}:{provider_id}".encode()
+    return hmac.new(key=PROVIDER_SECRET_SALT.encode(), 
+                    msg=msg, digestmod=hashlib.sha256).hexdigest()
 
 def create_access_token(username: str, user_id: int, role:str, expires_delta: timedelta):
     encode = {'sub':username, 'id':user_id, 'role':role}
@@ -183,6 +249,7 @@ def decode_pending_token(token: str) -> dict:
 async def get_current_user(token: Annotated[str, Depends(oauth2_bearer)]):
     return decode_user_from_token(token)
 
+user_dependency = Annotated[dict, Depends(get_current_user)]
 
 @router.get("/google/login")
 async def google_login(request: Request):
@@ -208,7 +275,7 @@ async def google_callback(request: Request, db=Depends(get_db)):
 
     # Extract  identifiers
     email = userinfo["email"]
-    sub = userinfo["sub"]  # provider user id
+    sub = hash_provider_id("google",userinfo["sub"])  
     username = userinfo.get("name", "")
     return RedirectResponse(oauth_login(db, "google", sub, username, email), status_code=302)
 
@@ -228,7 +295,7 @@ async def github_callback(
         userinfo = resp.json()
     
     # Extract  identifiers
-    provider_id = str(userinfo["id"])
+    provider_id = hash_provider_id("github", str(userinfo["id"]))
     username = userinfo.get("login", "")
     email = userinfo.get("email")
     if not email:
@@ -393,8 +460,33 @@ async def bind_account(
         "token_type": "bearer",
     }
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
-def create_user(db:db_dependency, request: UserRequest):
+@router.get("/otp/get-code/")
+async def get_otp_code(redis: Annotated[Redis, Depends(get_redis)], email: EmailStr):
+    key = f"otp:{email}"
+    existing = _load_verification(redis, key)
+    if existing:
+        created_at = datetime.fromisoformat(existing["created_at"])
+        age = (datetime.now(timezone.utc) - created_at).total_seconds()
+        if age < CODE_RESEND_SECONDS:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="A code has already been sent recently.")
+    
+    code = generate_numeric_code(6)
+    create_verification_entry(redis, key, code)
+
+    #This requires AWS SES setup
+    send_email(
+        to=email,
+        subject="Your LinkBottle account's One Time Passcode",
+        body=f"Your One Time Passcode is: \n {code}",
+    )
+    
+    # Right now, also just return the code to frontend.
+    return {"detail": "OTP code generated and sent.", "code": code}
+
+@router.post("/create_user/", status_code=status.HTTP_201_CREATED)
+def create_user(db:db_dependency, request: UserRequest, redis: Annotated[Redis, Depends(get_redis)]):
+    verify_otp_code(request.email, request.otp, redis)
+    
     user_check = db.query(database_models.Users).filter(database_models.Users.username == request.username).first()
     if user_check:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail='Username already taken.')
@@ -425,3 +517,38 @@ async def login_for_access_token(formdata: Annotated[OAuth2PasswordRequestForm, 
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail='Could not validate user.')
     token = create_access_token(user.username,user.id,user.role,timedelta(minutes=ACCESS_EXPIRE_TIME))#type: ignore
     return {'access_token':token,'token_type':'bearer'}
+
+@router.post("/change-password", status_code=status.HTTP_202_ACCEPTED)
+def change_password(user:user_dependency, db:db_dependency, redis: Annotated[Redis, Depends(get_redis)], 
+                   request: ChangePasswordRequest):
+    if not user:
+        raise HTTPException(401, detail='Authentication Failed.')
+
+    user_model = db.query(database_models.Users).filter(database_models.Users.id == user.get('id')).first()
+    if not user_model:
+        raise HTTPException(401, detail='Authentication Failed.')
+
+    verify_otp_code(user_model.email, request.otp, redis)
+
+    if user_model.hashed_password:
+        if not request.old_password:
+            raise HTTPException(400, detail='Old password is required.')
+        if not bcrypt_context.verify(request.old_password, user_model.hashed_password):
+            raise HTTPException(401, detail='Old password did not match.')
+    user_model.hashed_password = bcrypt_context.hash(request.new_password)
+    db.commit()
+    return 'Password Changed'
+
+@router.post("/forget-password", status_code=status.HTTP_202_ACCEPTED)
+def forget_password(request: ChangePasswordRequest, redis: Annotated[Redis, Depends(get_redis)],
+                    db: db_dependency, email: EmailStr):
+    user_model = db.query(database_models.Users).filter(
+        database_models.Users.email == email).first()
+    if not user_model:
+        raise HTTPException(404, detail='User not found.')
+
+    verify_otp_code(user_model.email, request.otp, redis)
+
+    user_model.hashed_password = bcrypt_context.hash(request.new_password)
+    db.commit()
+    return 'Password Changed'

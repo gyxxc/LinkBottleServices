@@ -16,7 +16,8 @@ app.add_middleware(
     allow_headers = ["*"],
     allow_credentials = True
     )
-app.add_middleware(SessionMiddleware, os.getenv("MIDDLEWARE_SECRET", "supersecretkey"))
+app.add_middleware(SessionMiddleware, 
+                   os.getenv("MIDDLEWARE_SECRET", "supersecretkey"))
 
 database_models.Base.metadata.create_all(bind=engine)
 
